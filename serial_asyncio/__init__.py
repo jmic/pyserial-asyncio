@@ -360,7 +360,7 @@ class SerialTransport(asyncio.Transport):
                 win32file.AllocateReadBuffer(1),
                 self._overlappedRead,
             )
-            loop.call_soon(self._ensure_reader)
+            self._loop.call_soon(self._ensure_reader)
 
         def _ensure_reader(self):
             if not self._has_reader and not self._closing:
@@ -593,11 +593,11 @@ if __name__ == '__main__':
             self._transport = transport
             print('port opened', self._transport)
             self._transport.serial.rts = False
-            self._transport.write(b'Hello, World!\n')
+            self._transport.write(b'\r')
 
         def data_received(self, data):
             print('data received', repr(data))
-            if b'\n' in data:
+            if b'SFC>' in data:
                 self._transport.close()
 
         def connection_lost(self, exc):
@@ -612,8 +612,8 @@ if __name__ == '__main__':
             print(self._transport.get_write_buffer_size())
             print('resume writing')
 
-    loop = asyncio.get_event_loop()
-    coro = create_serial_connection(loop, Output, '/dev/ttyUSB0', baudrate=115200)
+    loop = asyncio.new_event_loop()
+    coro = create_serial_connection(loop, Output, 'COM6', baudrate=9600, timeout=0)
     transport, protocol = loop.run_until_complete(coro)
     try:
         loop.run_forever()
