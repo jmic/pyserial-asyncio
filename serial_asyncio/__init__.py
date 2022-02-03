@@ -18,6 +18,11 @@ implementation. It should be possible to get that working though.
 import asyncio
 import os
 
+if os.name == "nt":
+    import win32event
+    import win32file
+    import concurrent.futures
+
 import serial
 
 try:
@@ -64,6 +69,19 @@ class SerialTransport(asyncio.Transport):
         # Asynchronous I/O requires non-blocking devices
         self._serial.timeout = 0
         self._serial.write_timeout = 0
+
+        # Create overlapped events for Windows
+        if os.name == "nt":
+            self._overlappedRead = win32file.OVERLAPPED()
+            self._overlappedRead.hEvent = win32event.CreateEvent(None, 1, 0, None)
+            self._overlappedReadStopEvent = win32event.CreateEvent(None, 0, 0, None)
+            self._read_wait_executor: concurrent.futures.ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1)
+            # Set comm timeouts necessary
+            # https://docs.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-commtimeouts
+            timeouts = 0, 0, 0, 0, 0
+            win32file.SetCommTimeouts(self._serial._port_handle, timeouts)
+            self._finish_port_setup()
 
         # These two callbacks will be enqueued in a FIFO queue by asyncio
         loop.call_soon(protocol.connection_made, self)
@@ -283,21 +301,74 @@ class SerialTransport(asyncio.Transport):
             assert self._has_writer
 
     if os.name == "nt":
-        def _poll_read(self):
-            if self._has_reader and not self._closing:
-                try:
-                    self._has_reader = self._loop.call_later(self._poll_wait_time, self._poll_read)
-                    if self.serial.in_waiting:
-                        self._read_ready()
-                except serial.SerialException as exc:
-                    self._fatal_error(exc, 'Fatal write error on serial transport')
+        def _finish_port_setup(self):
+            """
+            Finish setting up the serial port.
+            See https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile
+            """
+            flags, comstat = self._clear_comm_error()
+            rc, self.read_buf = win32file.ReadFile(
+                self._serial._port_handle,
+                win32file.AllocateReadBuffer(1),
+                self._overlappedRead,
+            )
+
+        def _wait_for_ready_read_event(self):
+            """
+            Blocking function, therefore should be called from outside the asyncio loop.
+            """
+            if not self._closing:
+                # See https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects
+                result = win32event.WaitForMultipleObjects([self._overlappedRead.hEvent, self._overlappedReadStopEvent], 0, -1)
+                if result == 0:
+                    self.loop.call_soon_threadsafe(self._process_read_event)
+                elif result == 1:
+                    win32event.ResetEvent(self._overlappedReadStopEvent)
+
+        def _clear_comm_error(self):
+            return win32file.ClearCommError(self._serial._port_handle)
+
+        def _process_read_event(self):
+            self._has_reader = False
+            # get that character we set up
+            n = win32file.GetOverlappedResult(
+                self._serial._port_handle, self._overlappedRead, 0
+            )
+            first = serial.to_bytes(self.read_buf[:n])
+            # now we should get everything that is already in the buffer
+            flags, comstat = self._clear_comm_error()
+            if comstat.cbInQue:
+                win32event.ResetEvent(self._overlappedRead.hEvent)
+                rc, buf = win32file.ReadFile(
+                    self._serial._port_handle,
+                    win32file.AllocateReadBuffer(comstat.cbInQue),
+                    self._overlappedRead,
+                )
+                n = win32file.GetOverlappedResult(
+                    self._serial._port_handle, self._overlappedRead, 1
+                )
+                # handle all the received data:
+                self._protocol.data_received(first + serial.to_bytes(buf[:n]))
+            else:
+                # handle all the received data:
+                self._protocol.data_received(first)
+
+            # set up next one
+            win32event.ResetEvent(self._overlappedRead.hEvent)
+            rc, self.read_buf = win32file.ReadFile(
+                self._serial._port_handle,
+                win32file.AllocateReadBuffer(1),
+                self._overlappedRead,
+            )
+            loop.call_soon(self._ensure_reader)
 
         def _ensure_reader(self):
             if not self._has_reader and not self._closing:
-                self._has_reader = self._loop.call_later(self._poll_wait_time, self._poll_read)
+                self._has_reader = self._loop.run_in_executor(self._read_wait_executor, self._wait_for_ready_read_event)
 
         def _remove_reader(self):
             if self._has_reader:
+                win32event.SetEvent(self._overlappedReadStopEvent)
                 self._has_reader.cancel()
             self._has_reader = False
 
@@ -544,5 +615,10 @@ if __name__ == '__main__':
     loop = asyncio.get_event_loop()
     coro = create_serial_connection(loop, Output, '/dev/ttyUSB0', baudrate=115200)
     transport, protocol = loop.run_until_complete(coro)
-    loop.run_forever()
-    loop.close()
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt as e:
+        print("Caught keyboard interrupt. Canceling tasks...")
+        transport.close()
+    finally:
+        loop.close()
